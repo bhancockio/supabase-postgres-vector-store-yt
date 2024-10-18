@@ -1,96 +1,86 @@
-<a href="https://demo-nextjs-with-supabase.vercel.app/">
-  <img alt="Next.js and Supabase Starter Kit - the fastest way to build apps with Next.js and Supabase" src="https://demo-nextjs-with-supabase.vercel.app/opengraph-image.png">
-  <h1 align="center">Next.js and Supabase Starter Kit</h1>
-</a>
+-- Ensure the pgvector extension is enabled.
+CREATE EXTENSION IF NOT EXISTS vector;
 
-<p align="center">
- The fastest way to build apps with Next.js and Supabase
-</p>
+-- Create the emails table.
+CREATE TABLE emails (
+id SERIAL PRIMARY KEY, -- Unique ID for each email
+subject TEXT NOT NULL, -- Subject of the email
+sender TEXT NOT NULL, -- Email address of the sender
+recipient TEXT[] NOT NULL, -- Array of recipients
+cc TEXT[], -- Optional CC recipients
+bcc TEXT[], -- Optional BCC recipients
+body TEXT NOT NULL, -- Full body of the email (raw content)
+created_at TIMESTAMPTZ DEFAULT NOW() -- Timestamp when the email was sent or received
+);
 
-<p align="center">
-  <a href="#features"><strong>Features</strong></a> ·
-  <a href="#demo"><strong>Demo</strong></a> ·
-  <a href="#deploy-to-vercel"><strong>Deploy to Vercel</strong></a> ·
-  <a href="#clone-and-run-locally"><strong>Clone and run locally</strong></a> ·
-  <a href="#feedback-and-issues"><strong>Feedback and issues</strong></a>
-  <a href="#more-supabase-examples"><strong>More Examples</strong></a>
-</p>
-<br/>
+-- Create the email_sections table.
+CREATE TABLE email_sections (
+id SERIAL PRIMARY KEY, -- Unique ID for each section
+email_id INT NOT NULL REFERENCES emails(id) ON DELETE CASCADE, -- Reference to parent email
+section_content TEXT NOT NULL, -- Content of the section (chunk)
+embedding VECTOR(1536), -- Embedding of the section
+section_order INT, -- Order of the section in the original email
+created_at TIMESTAMPTZ DEFAULT NOW() -- Timestamp for the section
+);
 
-## Features
+-- Create an HNSW index on the section embeddings using the correct operator class.
+CREATE INDEX section_embedding_hnsw_idx
+ON email_sections USING hnsw (embedding vector_cosine_ops);
 
-- Works across the entire [Next.js](https://nextjs.org) stack
-  - App Router
-  - Pages Router
-  - Middleware
-  - Client
-  - Server
-  - It just works!
-- supabase-ssr. A package to configure Supabase Auth to use cookies
-- Styling with [Tailwind CSS](https://tailwindcss.com)
-- Components with [shadcn/ui](https://ui.shadcn.com/)
-- Optional deployment with [Supabase Vercel Integration and Vercel deploy](#deploy-your-own)
-  - Environment variables automatically assigned to Vercel project
+-- Function: match_filtered_email_sections
+-- Description: This function retrieves relevant email sections based on a similarity search
+-- using a vector embedding and allows filtering by the sender or recipient email address.
 
-## Demo
+create or replace function match_filtered_email_sections(
+query_embedding vector(1536), -- Input: The embedding vector generated from the user's question (1536 dimensions for ADA-002).
+match_threshold float, -- Input: Minimum similarity threshold (only sections with similarity above this will be returned).
+match_count int, -- Input: Maximum number of results to return.
+email_address text -- Input: The email address used to filter by sender or recipient.
+)
+returns table (
+id int, -- Output: Unique ID of the email section.
+email_id int, -- Output: ID of the parent email (used to reference the full email).
+section_content text, -- Output: The content of the matching email section (a chunk of the email).
+similarity float -- Output: Similarity score between the query embedding and the section embedding.
+)
+language sql
+as $$
+-- Core SQL query to perform the similarity search and filter results.
+select
+es.id, -- Select the ID of the email section.
+es.email_id, -- Select the ID of the parent email to which this section belongs.
+es.section_content, -- Select the content of the section (chunk of the email).
+1 - (es.embedding <-> query_embedding) as similarity -- Calculate similarity score: 1 minus the cosine distance.
 
-You can view a fully working demo at [demo-nextjs-with-supabase.vercel.app](https://demo-nextjs-with-supabase.vercel.app/).
+from
+email_sections es -- From the email sections table (contains all the email chunks with their embeddings).
+join
+emails e on es.email_id = e.id -- Join with the emails table to access sender and recipient information.
 
-## Deploy to Vercel
+where
+-- Filter by sender or recipient: Only retrieve sections where the sender or recipient matches the given email address.
+(e.sender = email_address or e.recipient @> array[email_address])
 
-Vercel deployment will guide you through creating a Supabase account and project.
+    -- Apply the similarity threshold: Only return sections with a similarity score greater than the threshold.
+    and (1 - (es.embedding <-> query_embedding)) > match_threshold
 
-After installation of the Supabase integration, all relevant environment variables will be assigned to the project so the deployment is fully functioning.
+order by
+similarity desc -- Order the results by similarity in descending order (most similar first).
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fvercel%2Fnext.js%2Ftree%2Fcanary%2Fexamples%2Fwith-supabase&project-name=nextjs-with-supabase&repository-name=nextjs-with-supabase&demo-title=nextjs-with-supabase&demo-description=This+starter+configures+Supabase+Auth+to+use+cookies%2C+making+the+user%27s+session+available+throughout+the+entire+Next.js+app+-+Client+Components%2C+Server+Components%2C+Route+Handlers%2C+Server+Actions+and+Middleware.&demo-url=https%3A%2F%2Fdemo-nextjs-with-supabase.vercel.app%2F&external-id=https%3A%2F%2Fgithub.com%2Fvercel%2Fnext.js%2Ftree%2Fcanary%2Fexamples%2Fwith-supabase&demo-image=https%3A%2F%2Fdemo-nextjs-with-supabase.vercel.app%2Fopengraph-image.png)
+limit
+least(match_count, 200); -- Limit the number of results to the smaller of match_count or 200 to prevent large queries.
 
-The above will also clone the Starter kit to your GitHub, you can clone that locally and develop locally.
+$$
+;
 
-If you wish to just develop locally and not deploy to Vercel, [follow the steps below](#clone-and-run-locally).
 
-## Clone and run locally
+SELECT *
+FROM pg_proc
+WHERE proname = 'match_filtered_email_sections';
 
-1. You'll first need a Supabase project which can be made [via the Supabase dashboard](https://database.new)
 
-2. Create a Next.js app using the Supabase Starter template npx command
-
-   ```bash
-   npx create-next-app -e with-supabase
-   ```
-
-3. Use `cd` to change into the app's directory
-
-   ```bash
-   cd name-of-new-app
-   ```
-
-4. Rename `.env.example` to `.env.local` and update the following:
-
-   ```
-   NEXT_PUBLIC_SUPABASE_URL=[INSERT SUPABASE PROJECT URL]
-   NEXT_PUBLIC_SUPABASE_ANON_KEY=[INSERT SUPABASE PROJECT API ANON KEY]
-   ```
-
-   Both `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` can be found in [your Supabase project's API settings](https://app.supabase.com/project/_/settings/api)
-
-5. You can now run the Next.js local development server:
-
-   ```bash
-   npm run dev
-   ```
-
-   The starter kit should now be running on [localhost:3000](http://localhost:3000/).
-
-6. This template comes with the default shadcn/ui style initialized. If you instead want other ui.shadcn styles, delete `components.json` and [re-install shadcn/ui](https://ui.shadcn.com/docs/installation/next)
-
-> Check out [the docs for Local Development](https://supabase.com/docs/guides/getting-started/local-development) to also run Supabase locally.
-
-## Feedback and issues
-
-Please file feedback and issues over on the [Supabase GitHub org](https://github.com/supabase/supabase/issues/new/choose).
-
-## More Supabase examples
-
-- [Next.js Subscription Payments Starter](https://github.com/vercel/nextjs-subscription-payments)
-- [Cookie-based Auth and the Next.js 13 App Router (free course)](https://youtube.com/playlist?list=PL5S4mPUpp4OtMhpnp93EFSo42iQ40XjbF)
-- [Supabase Auth and the Next.js App Router](https://github.com/supabase/supabase/tree/master/examples/auth/nextjs)
+SELECT nspname AS schema_name, proname AS function_name
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE proname = 'match_filtered_email_sections';
+$$
